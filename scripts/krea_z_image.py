@@ -16,10 +16,16 @@ Prints a single JSON object to stdout:
 }
 
 Auth:
-  Export KREA_API_KEY (or KREA_TOKEN) or pass --token.
-  If neither is set, this script will also try to load the token from the
+  Export KREA_API_KEY / KREA_API_KEY_2 / KREA_API_KEY_3 (or KREA_TOKEN*)
+  or pass --token.
+  If neither is set, this script will also try to load token candidates from the
   local OpenClaw config (~/.openclaw/openclaw.json) under:
     skills.entries.krea-z-image.env.KREA_API_KEY
+    skills.entries.krea-z-image.env.KREA_API_KEY_2
+    skills.entries.krea-z-image.env.KREA_API_KEY_3
+
+  When job creation returns INSUFFICIENT_BALANCE (HTTP 402), the script
+  automatically retries with the next configured token.
 
 Note: Calls consume Krea credits.
 """
@@ -35,7 +41,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 API_BASE = "https://api.krea.ai"
 DEFAULT_UA = (
@@ -58,17 +64,46 @@ def _headers(token: str, user_agent: str) -> Dict[str, str]:
     }
 
 
-def _token_from_openclaw_config(skill_name: str = "krea-z-image", quiet: bool = False) -> Optional[str]:
+def _dedupe_keep_order(values: Iterable[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for value in values:
+        v = str(value).strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+
+def _extract_token_candidates(env: Dict[str, Any]) -> List[str]:
+    candidates: List[str] = []
+    for base in ("KREA_API_KEY", "KREA_TOKEN"):
+        primary = env.get(base)
+        if primary:
+            candidates.append(str(primary))
+
+        numbered: List[Tuple[int, str]] = []
+        prefix = f"{base}_"
+        for key, value in env.items():
+            if not value or not key.startswith(prefix):
+                continue
+            suffix = key[len(prefix):]
+            if suffix.isdigit():
+                numbered.append((int(suffix), str(value)))
+        for _, value in sorted(numbered, key=lambda x: x[0]):
+            candidates.append(value)
+
+    return _dedupe_keep_order(candidates)
+
+
+
+def _tokens_from_openclaw_config(skill_name: str = "krea-z-image", quiet: bool = False) -> List[str]:
     """Best-effort token lookup from the local OpenClaw config.
 
     This helps when running the script manually (outside the OpenClaw runtime)
     where skill-level env injection is not present.
-
-    Config path:
-      - OPENCLAW_CONFIG env var, else ~/.openclaw/openclaw.json
-
-    Expected location:
-      skills.entries.<skill_name>.env.KREA_API_KEY (or KREA_TOKEN)
     """
 
     cfg_path = os.environ.get("OPENCLAW_CONFIG") or os.path.expanduser("~/.openclaw/openclaw.json")
@@ -76,21 +111,20 @@ def _token_from_openclaw_config(skill_name: str = "krea-z-image", quiet: bool = 
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except FileNotFoundError:
-        return None
+        return []
     except Exception as e:
         if not quiet:
             _eprint(f"Warning: failed to read OpenClaw config at {cfg_path}: {e}")
-        return None
+        return []
 
     try:
         env = (
             (((cfg.get("skills") or {}).get("entries") or {}).get(skill_name) or {}).get("env")
             or {}
         )
-        tok = env.get("KREA_API_KEY") or env.get("KREA_TOKEN")
-        return str(tok) if tok else None
+        return _extract_token_candidates(env)
     except Exception:
-        return None
+        return []
 
 
 def _urllib_json(method: str, url: str, headers: Dict[str, str], body: Optional[dict]) -> Tuple[int, dict]:
@@ -146,6 +180,22 @@ def _curl_json(method: str, url: str, headers: Dict[str, str], body: Optional[di
     return code, j
 
 
+class KreaHttpError(RuntimeError):
+    def __init__(self, status_code: int, payload: dict):
+        self.status_code = status_code
+        self.payload = payload
+        super().__init__(f"HTTP {status_code}: {json.dumps(payload, ensure_ascii=False)}")
+
+
+
+def _is_insufficient_balance_error(err: Exception) -> bool:
+    if not isinstance(err, KreaHttpError) or err.status_code != 402:
+        return False
+    raw_text = json.dumps(err.payload, ensure_ascii=False).lower()
+    return "insufficient_balance" in raw_text or "insufficient balance" in raw_text
+
+
+
 def http_json(method: str, path: str, token: str, user_agent: str, body: Optional[dict] = None) -> dict:
     url = f"{API_BASE}{path}"
     headers = _headers(token, user_agent)
@@ -155,18 +205,38 @@ def http_json(method: str, path: str, token: str, user_agent: str, body: Optiona
     # Cloudflare 1010 commonly triggers when UA is "Python-urllib".
     # If it happens anyway, retry via curl which tends to work.
     if code in (401, 402, 400, 404, 429):
-        raise RuntimeError(f"HTTP {code}: {json.dumps(j, ensure_ascii=False)}")
+        raise KreaHttpError(code, j)
     if code == 403:
         raw_text = json.dumps(j, ensure_ascii=False).lower()
         if "1010" in raw_text or "access denied" in raw_text:
             code2, j2 = _curl_json(method, url, headers, body)
             if code2 in (401, 402, 400, 404, 429, 403):
-                raise RuntimeError(f"HTTP {code2}: {json.dumps(j2, ensure_ascii=False)}")
+                raise KreaHttpError(code2, j2)
             return j2
-        raise RuntimeError(f"HTTP 403: {json.dumps(j, ensure_ascii=False)}")
+        raise KreaHttpError(403, j)
     if code >= 400:
-        raise RuntimeError(f"HTTP {code}: {json.dumps(j, ensure_ascii=False)}")
+        raise KreaHttpError(code, j)
     return j
+
+
+
+def create_job_with_token_fallback(path: str, tokens: List[str], user_agent: str,
+                                   body: Optional[dict] = None, quiet: bool = False) -> Tuple[dict, str]:
+    last_error: Optional[Exception] = None
+    for idx, token in enumerate(tokens, start=1):
+        try:
+            if len(tokens) > 1 and not quiet:
+                _eprint(f"create_job: trying Krea token {idx}/{len(tokens)}")
+            return http_json("POST", path, token, user_agent, body), token
+        except Exception as err:
+            last_error = err
+            if _is_insufficient_balance_error(err) and idx < len(tokens):
+                if not quiet:
+                    _eprint(f"create_job: token {idx} has insufficient balance, switching")
+                continue
+            raise
+    assert last_error is not None
+    raise last_error
 
 
 def download(url: str, out_path: pathlib.Path, user_agent: str) -> None:
@@ -212,15 +282,18 @@ def main() -> int:
     if not (1 <= args.batch_size <= 4):
         raise SystemExit("--batch-size must be 1..4")
 
-    token = args.token or os.environ.get("KREA_API_KEY") or os.environ.get("KREA_TOKEN")
-    if not token:
-        token = _token_from_openclaw_config(quiet=args.quiet)
-        if token and not args.quiet:
-            _eprint("Loaded Krea token from OpenClaw config (~/.openclaw/openclaw.json).")
+    token_candidates = _dedupe_keep_order(
+        ([args.token] if args.token else [])
+        + _extract_token_candidates(dict(os.environ))
+        + _tokens_from_openclaw_config(quiet=args.quiet)
+    )
+    if token_candidates and not args.quiet:
+        source = "argument/env/config" if args.token else "env/config"
+        _eprint(f"Loaded {len(token_candidates)} Krea token candidate(s) from {source}.")
 
-    if not token:
+    if not token_candidates:
         raise SystemExit(
-            "Missing token. Provide --token, set KREA_API_KEY / KREA_TOKEN, "
+            "Missing token. Provide --token, set KREA_API_KEY / KREA_TOKEN (optionally KREA_API_KEY_2, KREA_API_KEY_3), "
             "or configure OpenClaw skill env (skills.entries.krea-z-image.env.KREA_API_KEY)."
         )
 
@@ -243,7 +316,13 @@ def main() -> int:
     if args.style_images_json:
         body["styleImages"] = json.loads(args.style_images_json)
 
-    job = http_json("POST", "/generate/image/z-image/z-image", token, args.user_agent, body)
+    job, token = create_job_with_token_fallback(
+        "/generate/image/z-image/z-image",
+        token_candidates,
+        args.user_agent,
+        body,
+        quiet=args.quiet,
+    )
     job_id = job.get("job_id")
     if not job_id:
         raise SystemExit(f"No job_id in response: {json.dumps(job, ensure_ascii=False)}")
