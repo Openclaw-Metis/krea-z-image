@@ -188,11 +188,61 @@ class KreaHttpError(RuntimeError):
 
 
 
+def _extract_krea_error_code(payload: dict) -> Optional[str]:
+    candidates = [
+        payload.get("code"),
+        payload.get("error_code"),
+        (payload.get("error") or {}).get("code") if isinstance(payload.get("error"), dict) else None,
+    ]
+    for value in candidates:
+        if value:
+            return str(value)
+    return None
+
+
+
+def _extract_krea_error_message(payload: dict) -> Optional[str]:
+    candidates = [
+        payload.get("message"),
+        payload.get("error"),
+        payload.get("detail"),
+        (payload.get("error") or {}).get("message") if isinstance(payload.get("error"), dict) else None,
+    ]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+
+def _format_krea_error(err: Exception) -> str:
+    if not isinstance(err, KreaHttpError):
+        return str(err)
+    code = _extract_krea_error_code(err.payload)
+    message = _extract_krea_error_message(err.payload)
+    parts = [f"HTTP {err.status_code}"]
+    if code:
+        parts.append(code)
+    if message:
+        parts.append(message)
+    return ": ".join([parts[0], " - ".join(parts[1:])]) if len(parts) > 1 else parts[0]
+
+
+
 def _is_insufficient_balance_error(err: Exception) -> bool:
     if not isinstance(err, KreaHttpError) or err.status_code != 402:
         return False
     raw_text = json.dumps(err.payload, ensure_ascii=False).lower()
     return "insufficient_balance" in raw_text or "insufficient balance" in raw_text
+
+
+
+def _format_job_create_failure(err: Exception, token_count: int) -> str:
+    if _is_insufficient_balance_error(err):
+        if token_count > 1:
+            return f"All {token_count} configured Krea tokens returned INSUFFICIENT_BALANCE (HTTP 402)."
+        return "Configured Krea token returned INSUFFICIENT_BALANCE (HTTP 402)."
+    return f"Failed to create Krea job after trying {token_count} token(s): {_format_krea_error(err)}"
 
 
 
@@ -232,7 +282,7 @@ def create_job_with_token_fallback(path: str, tokens: List[str], user_agent: str
             last_error = err
             if _is_insufficient_balance_error(err) and idx < len(tokens):
                 if not quiet:
-                    _eprint(f"create_job: token {idx} has insufficient balance, switching")
+                    _eprint(f"create_job: token {idx}/{len(tokens)} has insufficient balance, switching to token {idx + 1}/{len(tokens)}")
                 continue
             raise
     assert last_error is not None
@@ -316,13 +366,16 @@ def main() -> int:
     if args.style_images_json:
         body["styleImages"] = json.loads(args.style_images_json)
 
-    job, token = create_job_with_token_fallback(
-        "/generate/image/z-image/z-image",
-        token_candidates,
-        args.user_agent,
-        body,
-        quiet=args.quiet,
-    )
+    try:
+        job, token = create_job_with_token_fallback(
+            "/generate/image/z-image/z-image",
+            token_candidates,
+            args.user_agent,
+            body,
+            quiet=args.quiet,
+        )
+    except Exception as e:
+        raise SystemExit(_format_job_create_failure(e, len(token_candidates)))
     job_id = job.get("job_id")
     if not job_id:
         raise SystemExit(f"No job_id in response: {json.dumps(job, ensure_ascii=False)}")
